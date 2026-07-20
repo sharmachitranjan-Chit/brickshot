@@ -1,0 +1,90 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prepare web assets
+        run: |
+          mkdir -p www
+          cp index.html www/
+          cp manifest.webmanifest www/ || true
+          cp sw.js www/ || true
+          cp *.png www/ || true
+
+      - name: Create Android wrapper (Capacitor)
+        run: |
+          npm init -y
+          npm install @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          npx cap init BrickShot com.moneyclarity.brickshot --web-dir www
+          npx cap add android
+
+      - name: Generate launcher icons
+        run: |
+          npm install @capacitor/assets@3 --save-dev
+          mkdir -p assets
+          cp icon-512.png assets/logo.png
+          cp icon-512.png assets/icon-only.png
+          npx capacitor-assets generate --android || true
+
+      - name: Auto-increment version
+        run: |
+          sed -i "s/versionCode 1/versionCode ${GITHUB_RUN_NUMBER}/" android/app/build.gradle
+          sed -i "s/versionName \"1.0\"/versionName \"1.0.${GITHUB_RUN_NUMBER}\"/" android/app/build.gradle
+
+      - name: Signing key (created on first run, then reused from the repo)
+        run: |
+          if [ ! -f release.keystore ]; then
+            keytool -genkeypair -v -keystore release.keystore -alias brickshot \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass brickshot123 -keypass brickshot123 \
+              -dname "CN=BrickShot, O=MoneyClarity"
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add release.keystore
+            git commit -m "Add signing keystore [skip ci]"
+            git push
+          fi
+
+      - name: Build release APK
+        run: |
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK
+        run: |
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+          "$ANDROID_HOME/build-tools/$BT/zipalign" -p 4 \
+            android/app/build/outputs/apk/release/app-release-unsigned.apk BrickShot-aligned.apk
+          "$ANDROID_HOME/build-tools/$BT/apksigner" sign \
+            --ks release.keystore --ks-pass pass:brickshot123 --key-pass pass:brickshot123 \
+            --out BrickShot.apk BrickShot-aligned.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BrickShot-APK
+          path: BrickShot.apk
